@@ -4,20 +4,190 @@ RIASEC Career Test Backend API Testing
 Tests all backend endpoints for the Arabic RIASEC system
 """
 
-import requests
-import sys
+import argparse
 import json
+import sys
 from datetime import datetime
-from typing import Dict, List, Any
+from typing import Any, Dict, List
+
+import requests
+
+
+class MockResponse:
+    """Simple response object for offline testing."""
+
+    def __init__(self, json_data: Any, status_code: int = 200):
+        self._json = json_data
+        self.status_code = status_code
+        self.text = json.dumps(json_data, ensure_ascii=False)
+
+    def json(self) -> Any:
+        return self._json
 
 class RIASECAPITester:
-    def __init__(self, base_url="https://future-major-test.preview.emergentagent.com"):
+    def __init__(
+        self,
+        base_url: str = "https://future-major-test.preview.emergentagent.com",
+        offline: bool = False,
+    ):
         self.base_url = base_url
         self.api_url = f"{base_url}/api"
         self.admin_token = "admin123"
         self.tests_run = 0
         self.tests_passed = 0
         self.test_results = []
+        self.offline = offline
+
+        if self.offline:
+            self._init_offline_data()
+
+    def _init_offline_data(self) -> None:
+        """Initialize data used when running without network access."""
+        axes = ["R", "I", "A", "S", "E", "C"]
+        self._questions = [
+            {
+                "id": f"q{i}",
+                "text_ar": f"سؤال {i}",
+                "axis": axes[(i - 1) % 6],
+                "is_active": True,
+            }
+            for i in range(1, 31)
+        ]
+        self._institutions = [
+            {
+                "id": "inst1",
+                "name_ar": "جامعة بغداد",
+                "city": "بغداد",
+                "governorate": "بغداد",
+                "type": "university",
+            },
+            {
+                "id": "inst2",
+                "name_ar": "جامعة البصرة",
+                "city": "البصرة",
+                "governorate": "البصرة",
+                "type": "university",
+            },
+        ]
+        self._majors = [
+            {
+                "id": "m1",
+                "institution_id": "inst1",
+                "college_name_ar": "كلية الهندسة",
+                "major_name_ar": "هندسة ميكانيكية",
+                "branch_eligibility": ["scientific"],
+                "study_mode": "morning",
+                "riasec_match": ["R", "I"],
+            },
+            {
+                "id": "m2",
+                "institution_id": "inst2",
+                "college_name_ar": "كلية الفنون الجميلة",
+                "major_name_ar": "التصميم",
+                "branch_eligibility": ["arts", "literary"],
+                "study_mode": "morning",
+                "riasec_match": ["A"],
+            },
+        ]
+        self._last_attempt: Dict[str, Any] | None = None
+
+    # ------------------------------------------------------------------
+    # HTTP helpers
+    def _get(self, path: str, **kwargs) -> MockResponse | requests.Response:
+        if self.offline:
+            return self._offline_get(path, **kwargs)
+        return requests.get(f"{self.api_url}{path}", **kwargs)
+
+    def _post(
+        self, path: str, json: Any = None, **kwargs
+    ) -> MockResponse | requests.Response:
+        if self.offline:
+            return self._offline_post(path, json=json, **kwargs)
+        return requests.post(f"{self.api_url}{path}", json=json, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Offline implementations
+    def _offline_get(self, path: str, headers: Dict[str, str] | None = None, **_: Any) -> MockResponse:
+        if path == "/":
+            return MockResponse({"message": "RIASEC API running"})
+        if path == "/questions":
+            return MockResponse(self._questions)
+        if path.startswith("/attempt/"):
+            attempt_id = path.split("/")[-1]
+            if self._last_attempt and self._last_attempt["id"] == attempt_id:
+                return MockResponse(self._last_attempt)
+            return MockResponse({"detail": "Not found"}, status_code=404)
+        if path == "/admin/stats":
+            auth = headers.get("Authorization") if headers else None
+            if auth == f"Bearer {self.admin_token}":
+                return MockResponse(
+                    {
+                        "total_attempts": 1,
+                        "total_students": 1,
+                        "branch_distribution": {"scientific": 1},
+                        "popular_axes": {"R": 1},
+                    }
+                )
+            return MockResponse({"detail": "Invalid admin token"}, status_code=401)
+        if path == "/institutions":
+            return MockResponse(self._institutions)
+        if path.startswith("/majors"):
+            if "branch=scientific" in path:
+                filtered = [
+                    m for m in self._majors if "scientific" in m["branch_eligibility"]
+                ]
+                return MockResponse(filtered)
+            return MockResponse(self._majors)
+        return MockResponse({}, status_code=404)
+
+    def _offline_post(
+        self, path: str, json: Any | None = None, **_: Any
+    ) -> MockResponse:
+        if path != "/attempt" or not json:
+            return MockResponse({}, status_code=404)
+
+        student = json.get("student", {})
+        answers = json.get("answers", [])
+        question_map = {q["id"]: q for q in self._questions}
+        axis_scores: Dict[str, List[int]] = {a: [] for a in ["R", "I", "A", "S", "E", "C"]}
+        for ans in answers:
+            q = question_map.get(ans["question_id"])
+            if q:
+                axis_scores[q["axis"]].append(ans["value"])
+
+        scores: Dict[str, float] = {}
+        for axis, vals in axis_scores.items():
+            if vals:
+                avg = sum(vals) / len(vals)
+                scores[axis] = round((avg - 1) / 4 * 100, 1)
+            else:
+                scores[axis] = 0.0
+
+        top_axes = sorted(scores, key=scores.get, reverse=True)[:3]
+        recommendations: List[Dict[str, str]] = []
+        if "R" in top_axes[:2] and "I" in top_axes[:2]:
+            recommendations.append(
+                {"major": "هندسة ميكانيكية", "college": "كلية الهندسة"}
+            )
+        elif "A" in top_axes[:2]:
+            recommendations.append(
+                {"major": "التصميم", "college": "كلية الفنون الجميلة"}
+            )
+        else:
+            recommendations.append(
+                {"major": "إدارة الأعمال", "college": "كلية الإدارة والاقتصاد"}
+            )
+
+        attempt_result = {
+            "id": "offline-attempt-1",
+            "student": student,
+            "scores": scores,
+            "top_axes": top_axes,
+            "recommendations": recommendations,
+            "completed_at": datetime.utcnow().isoformat(),
+        }
+        self._last_attempt = attempt_result
+        return MockResponse(attempt_result)
 
     def log_test(self, name: str, success: bool, details: str = ""):
         """Log test result"""
@@ -37,7 +207,7 @@ class RIASECAPITester:
     def test_api_root(self):
         """Test API root endpoint"""
         try:
-            response = requests.get(f"{self.api_url}/", timeout=10)
+            response = self._get("/", timeout=10)
             success = response.status_code == 200
             data = response.json() if success else {}
             
@@ -54,7 +224,7 @@ class RIASECAPITester:
     def test_get_questions(self):
         """Test questions endpoint"""
         try:
-            response = requests.get(f"{self.api_url}/questions", timeout=10)
+            response = self._get("/questions", timeout=10)
             success = response.status_code == 200
             
             if success:
@@ -126,7 +296,7 @@ class RIASECAPITester:
                 "answers": answers
             }
             
-            response = requests.post(f"{self.api_url}/attempt", json=attempt_data, timeout=15)
+            response = self._post("/attempt", json=attempt_data, timeout=15)
             
             if response.status_code == 200:
                 result = response.json()
@@ -173,7 +343,7 @@ class RIASECAPITester:
             
         try:
             attempt_id = attempt_result['id']
-            response = requests.get(f"{self.api_url}/attempt/{attempt_id}", timeout=10)
+            response = self._get(f"/attempt/{attempt_id}", timeout=10)
             
             if response.status_code == 200:
                 retrieved = response.json()
@@ -191,7 +361,7 @@ class RIASECAPITester:
         """Test admin statistics endpoint"""
         try:
             headers = {"Authorization": f"Bearer {self.admin_token}"}
-            response = requests.get(f"{self.api_url}/admin/stats", headers=headers, timeout=10)
+            response = self._get("/admin/stats", headers=headers, timeout=10)
             
             if response.status_code == 200:
                 stats = response.json()
@@ -212,7 +382,7 @@ class RIASECAPITester:
         """Test admin authentication failure"""
         try:
             headers = {"Authorization": "Bearer wrong_token"}
-            response = requests.get(f"{self.api_url}/admin/stats", headers=headers, timeout=10)
+            response = self._get("/admin/stats", headers=headers, timeout=10)
             
             if response.status_code == 401:
                 self.log_test("Admin Auth Failure", True, "Correctly rejected invalid token")
@@ -225,7 +395,7 @@ class RIASECAPITester:
     def test_institutions(self):
         """Test institutions endpoint"""
         try:
-            response = requests.get(f"{self.api_url}/institutions", timeout=10)
+            response = self._get("/institutions", timeout=10)
             
             if response.status_code == 200:
                 institutions = response.json()
@@ -250,7 +420,7 @@ class RIASECAPITester:
         """Test majors endpoint with filtering"""
         try:
             # Test basic majors endpoint
-            response = requests.get(f"{self.api_url}/majors", timeout=10)
+            response = self._get("/majors", timeout=10)
             
             if response.status_code == 200:
                 majors = response.json()
@@ -262,7 +432,7 @@ class RIASECAPITester:
                         self.log_test("Get Majors", True, f"Found {len(majors)} majors")
                         
                         # Test filtering by branch
-                        response_filtered = requests.get(f"{self.api_url}/majors?branch=scientific", timeout=10)
+                        response_filtered = self._get("/majors?branch=scientific", timeout=10)
                         if response_filtered.status_code == 200:
                             filtered_majors = response_filtered.json()
                             self.log_test("Filter Majors by Branch", True, f"Scientific majors: {len(filtered_majors)}")
@@ -313,7 +483,7 @@ class RIASECAPITester:
                 "answers": answers
             }
             
-            response = requests.post(f"{self.api_url}/attempt", json=attempt_data, timeout=15)
+            response = self._post("/attempt", json=attempt_data, timeout=15)
             
             if response.status_code == 200:
                 result = response.json()
@@ -371,7 +541,7 @@ class RIASECAPITester:
                 "answers": answers
             }
             
-            response = requests.post(f"{self.api_url}/attempt", json=attempt_data, timeout=15)
+            response = self._post("/attempt", json=attempt_data, timeout=15)
             
             if response.status_code == 200:
                 result = response.json()
@@ -440,10 +610,24 @@ class RIASECAPITester:
                 print(f"   - {test['name']}: {test['details']}")
             return False
 
-def main():
-    tester = RIASECAPITester()
+def main() -> int:
+    parser = argparse.ArgumentParser(description="RIASEC backend tests")
+    parser.add_argument(
+        "--base-url",
+        default="https://future-major-test.preview.emergentagent.com",
+        help="Base URL of the API",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Run tests without network access using mock responses",
+    )
+    args = parser.parse_args()
+
+    tester = RIASECAPITester(base_url=args.base_url, offline=args.offline)
     success = tester.run_all_tests()
     return 0 if success else 1
+
 
 if __name__ == "__main__":
     sys.exit(main())
