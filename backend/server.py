@@ -1,19 +1,34 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 from pathlib import Path
-from pydantic import BaseModel, Field
-from typing import List, Dict, Optional, Any
-import uuid
-from datetime import datetime, timezone
+from datetime import timedelta, timezone
 import statistics
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from models import (
+    Student, Question, Answer, AttemptCreate, AttemptResult,
+    Institution, Major, AdminStats, Token
+)
+from typing import List, Dict, Optional, Any
+from datetime import datetime, timezone
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
+
+# Security settings
+SECRET_KEY = os.environ.get("SECRET_KEY", "a_very_secret_key_that_should_be_in_env")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH")  # Store hashed password in env
+
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
@@ -26,124 +41,45 @@ app = FastAPI(title="RIASEC Career Test API", version="1.0.0")
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
-# Security
-security = HTTPBearer()
-ADMIN_TOKEN = "admin123"  # Simple token for admin panel
+# OAuth2 Scheme
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/admin/login")
 
-def verify_admin_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if credentials.credentials != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid admin token")
-    return credentials
+# --- Security Functions ---
 
-# Pydantic Models
-class Student(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    name: str
-    branch: str  # scientific, literary, arts
-    governorate: Optional[str] = None
-    phone: Optional[str] = None
-    email: Optional[str] = None
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
 
-class Question(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    text_ar: str
-    axis: str  # R, I, A, S, E, C
-    is_active: bool = True
+def get_password_hash(password):
+    return pwd_context.hash(password)
 
-class Answer(BaseModel):
-    question_id: str
-    value: int  # 1-5 Likert scale
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
 
-class AttemptCreate(BaseModel):
-    student: Student
-    answers: List[Answer]
+async def get_current_admin_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=401,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None or username != ADMIN_USERNAME:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    return username
 
-class AttemptResult(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    student: Student
-    scores: Dict[str, float]  # R, I, A, S, E, C percentages
-    top_axes: List[str]  # Top 3 axes
-    recommendations: List[Dict[str, Any]]
-    completed_at: datetime
+# Pydantic Models are now in models.py
 
-class Institution(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    name_ar: str
-    city: str
-    governorate: str
-    type: str  # university, institute, polytechnic
-
-class Major(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    institution_id: str
-    college_name_ar: str
-    major_name_ar: str
-    branch_eligibility: List[str]  # scientific, literary, arts
-    study_mode: str  # morning, evening, both
-    riasec_match: List[str]  # Primary RIASEC axes
-
-class AdminStats(BaseModel):
-    total_attempts: int
-    total_students: int
-    branch_distribution: Dict[str, int]
-    popular_axes: Dict[str, int]
-
-# Sample data initialization
-SAMPLE_QUESTIONS = [
-    {"text_ar": "أستمتع بإصلاح أو تركيب الأشياء الميكانيكية", "axis": "R"},
-    {"text_ar": "أفضل العمل العملي باستخدام الأدوات", "axis": "R"},
-    {"text_ar": "أحب العمل في الورش والمختبرات", "axis": "R"},
-    {"text_ar": "أستمتع بالأعمال اليدوية والحرفية", "axis": "R"},
-    {"text_ar": "أفضل العمل في البيئة الخارجية", "axis": "R"},
-    {"text_ar": "أستمتع بحل المسائل المعقدة والمنطقية", "axis": "I"},
-    {"text_ar": "أحب إجراء التجارب العلمية", "axis": "I"},
-    {"text_ar": "أستمتع بتحليل البيانات والمعلومات", "axis": "I"},
-    {"text_ar": "أحب البحث والدراسة المتعمقة", "axis": "I"},
-    {"text_ar": "أستمتع بفهم كيفية عمل الأشياء", "axis": "I"},
-    {"text_ar": "أحب الرسم والتصميم الفني", "axis": "A"},
-    {"text_ar": "أستمتع بالكتابة الإبداعية", "axis": "A"},
-    {"text_ar": "أحب الموسيقى والفنون الأدائية", "axis": "A"},
-    {"text_ar": "أستمتع بابتكار أفكار جديدة وأصيلة", "axis": "A"},
-    {"text_ar": "أحب التعبير عن نفسي بطرق إبداعية", "axis": "A"},
-    {"text_ar": "أستمد طاقتي من مساعدة الآخرين", "axis": "S"},
-    {"text_ar": "أحب التدريس والإرشاد", "axis": "S"},
-    {"text_ar": "أستمتع بالعمل مع الأطفال", "axis": "S"},
-    {"text_ar": "أحب المشاركة في الأعمال التطوعية", "axis": "S"},
-    {"text_ar": "أستمتع بحل مشاكل الناس", "axis": "S"},
-    {"text_ar": "أحب قيادة الفرق واتخاذ القرارات", "axis": "E"},
-    {"text_ar": "أستمتع بالتفاوض والإقناع", "axis": "E"},
-    {"text_ar": "أحب تنظيم الفعاليات والمشاريع", "axis": "E"},
-    {"text_ar": "أستمتع بإدارة الأعمال", "axis": "E"},
-    {"text_ar": "أحب المخاطرة المحسوبة في العمل", "axis": "E"},
-    {"text_ar": "أفضل الأعمال المنظمة والروتينية", "axis": "C"},
-    {"text_ar": "أستمتع بترتيب البيانات والجداول", "axis": "C"},
-    {"text_ar": "أحب العمل بالأرقام والحسابات", "axis": "C"},
-    {"text_ar": "أستمتع بالأعمال المكتبية والإدارية", "axis": "C"},
-    {"text_ar": "أحب اتباع القواعد والإجراءات", "axis": "C"}
-]
-
-SAMPLE_INSTITUTIONS = [
-    {"name_ar": "جامعة بغداد", "city": "بغداد", "governorate": "بغداد", "type": "university"},
-    {"name_ar": "جامعة البصرة", "city": "البصرة", "governorate": "البصرة", "type": "university"},
-    {"name_ar": "جامعة الموصل", "city": "الموصل", "governorate": "نينوى", "type": "university"},
-    {"name_ar": "الجامعة التكنولوجية", "city": "بغداد", "governorate": "بغداد", "type": "university"},
-    {"name_ar": "معهد التدريب النفطي", "city": "كركوك", "governorate": "كركوك", "type": "institute"}
-]
-
-SAMPLE_MAJORS = [
-    {"college_name_ar": "كلية الهندسة", "major_name_ar": "هندسة ميكانيكية", "branch_eligibility": ["scientific"], "study_mode": "morning", "riasec_match": ["R", "I"]},
-    {"college_name_ar": "كلية الهندسة", "major_name_ar": "هندسة مدنية", "branch_eligibility": ["scientific"], "study_mode": "both", "riasec_match": ["R", "I"]},
-    {"college_name_ar": "كلية الطب", "major_name_ar": "الطب العام", "branch_eligibility": ["scientific"], "study_mode": "morning", "riasec_match": ["I", "S"]},
-    {"college_name_ar": "كلية الصيدلة", "major_name_ar": "الصيدلة", "branch_eligibility": ["scientific"], "study_mode": "morning", "riasec_match": ["I", "S"]},
-    {"college_name_ar": "كلية علوم الحاسوب", "major_name_ar": "علوم الحاسوب", "branch_eligibility": ["scientific"], "study_mode": "both", "riasec_match": ["I", "C"]},
-    {"college_name_ar": "كلية الفنون الجميلة", "major_name_ar": "التصميم", "branch_eligibility": ["arts", "literary"], "study_mode": "morning", "riasec_match": ["A"]},
-    {"college_name_ar": "كلية التربية", "major_name_ar": "التربية", "branch_eligibility": ["scientific", "literary"], "study_mode": "both", "riasec_match": ["S"]},
-    {"college_name_ar": "كلية الإدارة والاقتصاد", "major_name_ar": "إدارة الأعمال", "branch_eligibility": ["scientific", "literary"], "study_mode": "both", "riasec_match": ["E", "C"]},
-    {"college_name_ar": "كلية الإدارة والاقتصاد", "major_name_ar": "المحاسبة", "branch_eligibility": ["scientific", "literary"], "study_mode": "both", "riasec_match": ["C"]},
-    {"college_name_ar": "كلية الآداب", "major_name_ar": "اللغة العربية", "branch_eligibility": ["literary"], "study_mode": "both", "riasec_match": ["A", "S"]},
-    {"college_name_ar": "كلية الإعلام", "major_name_ar": "الصحافة", "branch_eligibility": ["literary"], "study_mode": "morning", "riasec_match": ["A", "E"]},
-    {"college_name_ar": "كلية التمريض", "major_name_ar": "التمريض", "branch_eligibility": ["scientific"], "study_mode": "morning", "riasec_match": ["S", "I"]}
-]
+from initial_data import SAMPLE_QUESTIONS, SAMPLE_INSTITUTIONS, SAMPLE_MAJORS
 
 # Startup event to initialize sample data
 @app.on_event("startup")
@@ -172,37 +108,7 @@ async def startup_event():
         await db.majors.insert_many(majors)
         logger.info("Initialized sample majors")
 
-# RIASEC calculation functions
-def calculate_riasec_scores(answers: List[Answer], questions: List[Question]) -> Dict[str, float]:
-    """Calculate RIASEC scores from answers"""
-    axis_scores = {"R": [], "I": [], "A": [], "S": [], "E": [], "C": []}
-    question_map = {q["id"]: q for q in questions}
-    
-    for answer in answers:
-        if answer.question_id in question_map:
-            axis = question_map[answer.question_id]["axis"]
-            axis_scores[axis].append(answer.value)
-    
-    # Calculate normalized scores (0-100)
-    normalized_scores = {}
-    for axis, scores in axis_scores.items():
-        if scores:
-            avg_score = sum(scores) / len(scores)
-            normalized_scores[axis] = round((avg_score - 1) / 4 * 100, 1)
-        else:
-            normalized_scores[axis] = 0.0
-    
-    return normalized_scores
-
-def get_top_axes(scores: Dict[str, float]) -> List[str]:
-    """Get top 3 RIASEC axes"""
-    sorted_axes = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    return [axis for axis, score in sorted_axes[:3]]
-
-def get_recommendations(top_axes: List[str], student_branch: str) -> List[Dict[str, Any]]:
-    """Get major recommendations based on RIASEC scores and student branch"""
-    # Query majors that match the student's branch and RIASEC profile
-    return []  # Will be implemented with actual database query
+from utils import calculate_riasec_scores, get_top_axes
 
 # API Routes
 @api_router.get("/")
@@ -219,7 +125,8 @@ async def get_questions():
 async def submit_attempt(attempt: AttemptCreate):
     """Submit test attempt and get results"""
     # Get questions for calculation
-    questions = await db.questions.find({"is_active": True}).to_list(1000)
+    question_docs = await db.questions.find({"is_active": True}).to_list(1000)
+    questions = [Question(**q) for q in question_docs]
     
     # Calculate RIASEC scores
     scores = calculate_riasec_scores(attempt.answers, questions)
@@ -277,7 +184,28 @@ async def get_attempt(attempt_id: str):
     return AttemptResult(**attempt)
 
 # Admin routes
-@api_router.get("/admin/stats", response_model=AdminStats, dependencies=[Depends(verify_admin_token)])
+# --- Admin Routes ---
+
+@api_router.post("/admin/login", response_model=Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    # In a real app, you'd look up the user in a database
+    if not ADMIN_PASSWORD_HASH:
+        raise HTTPException(status_code=500, detail="Admin account is not configured")
+
+    if form_data.username == ADMIN_USERNAME and verify_password(form_data.password, ADMIN_PASSWORD_HASH):
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": ADMIN_USERNAME}, expires_delta=access_token_expires
+        )
+        return {"access_token": access_token, "token_type": "bearer"}
+
+    raise HTTPException(
+        status_code=401,
+        detail="Incorrect username or password",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+@api_router.get("/admin/stats", response_model=AdminStats, dependencies=[Depends(get_current_admin_user)])
 async def get_admin_stats():
     """Get admin statistics"""
     total_attempts = await db.attempts.count_documents({})
@@ -303,13 +231,13 @@ async def get_admin_stats():
         popular_axes=popular_axes
     )
 
-@api_router.get("/admin/questions", response_model=List[Question], dependencies=[Depends(verify_admin_token)])
+@api_router.get("/admin/questions", response_model=List[Question], dependencies=[Depends(get_current_admin_user)])
 async def get_admin_questions():
     """Get all questions for admin"""
     questions = await db.questions.find().to_list(1000)
     return [Question(**q) for q in questions]
 
-@api_router.post("/admin/questions", response_model=Question, dependencies=[Depends(verify_admin_token)])
+@api_router.post("/admin/questions", response_model=Question, dependencies=[Depends(get_current_admin_user)])
 async def create_question(question: Question):
     """Create new question"""
     await db.questions.insert_one(question.dict())
